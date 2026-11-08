@@ -28,7 +28,8 @@ CUB_NAMESPACE_BEGIN
 
 namespace detail::segmented_sort_capacity
 {
-// Each block walks one tile of block_threads * segments_per_thread segments. Empty segments are skipped,
+// Each block walks one tile of block_threads * segments_per_thread segments, where segments_per_thread is at
+// most tiny_walk_policy::segments_per_thread. Empty segments are skipped,
 // singletons are copied, and segments shorter than inline_cutoff are queued by logical warp size and sorted
 // by the block. Longer segments are counted by capacity and appended to deferred_ids in no particular order;
 // the block flushes its counts only if it found one.
@@ -37,21 +38,23 @@ __launch_bounds__(tiny_walk_policy::block_threads) _CCCL_KERNEL_ATTRIBUTES void 
   BeginIterator begins,
   EndIterator ends,
   unsigned num_segments,
+  int segments_per_thread,
   const Key* in,
   Key* out,
   unsigned* counts,
   unsigned* deferred_count,
   unsigned* deferred_ids)
 {
-  using policy_t                   = tiny_walk_policy;
-  using sorter_t                   = tiny_sort_implementation<Key>;
-  constexpr unsigned total_bins    = Capacities::size + 1;
-  constexpr unsigned tile_segments = policy_t::block_threads * policy_t::segments_per_thread;
+  using policy_t                       = tiny_walk_policy;
+  using sorter_t                       = tiny_sort_implementation<Key>;
+  constexpr unsigned total_bins        = Capacities::size + 1;
+  constexpr unsigned max_tile_segments = policy_t::block_threads * policy_t::segments_per_thread;
+  const unsigned tile_segments         = policy_t::block_threads * segments_per_thread;
   // One queue each for logical warps of 1, 2, and 4 threads.
   constexpr int num_queues = 3;
   __shared__ unsigned bin_counts_shared[total_bins];
   __shared__ unsigned queue_sizes_shared[num_queues];
-  __shared__ unsigned queues_shared[num_queues][tile_segments];
+  __shared__ unsigned queues_shared[num_queues][max_tile_segments];
   __shared__ typename sorter_t::temp_storage sort_storage;
   for (unsigned bin_idx = threadIdx.x; bin_idx < total_bins; bin_idx += blockDim.x)
   {
@@ -66,7 +69,7 @@ __launch_bounds__(tiny_walk_policy::block_threads) _CCCL_KERNEL_ATTRIBUTES void 
   // Compare tile-local indices so that the last tile cannot overflow unsigned segment IDs.
   const unsigned tile_size = (::cuda::std::min) (tile_segments, num_segments - tile_begin);
   bool has_deferred        = false;
-  for (int pass = 0; pass < policy_t::segments_per_thread; ++pass)
+  for (int pass = 0; pass < segments_per_thread; ++pass)
   {
     const unsigned idx_in_tile = pass * policy_t::block_threads + threadIdx.x;
     if (idx_in_tile < tile_size)

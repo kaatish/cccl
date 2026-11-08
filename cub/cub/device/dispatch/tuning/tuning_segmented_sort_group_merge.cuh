@@ -34,8 +34,10 @@ struct partition_policy
 // Lengths 2 to inline_cutoff - 1 are sorted by logical warps of up to max_threads threads.
 struct tiny_walk_policy
 {
-  static constexpr int block_threads       = 32;
+  static constexpr int block_threads = 32;
+  // The largest tile; dispatch halves it while the grid would be short of min_waves waves of resident blocks.
   static constexpr int segments_per_thread = 4;
+  static constexpr int min_waves           = 2;
   static constexpr int items_per_thread    = 9;
   static constexpr int max_threads         = 4;
   // Exclusive: the walk sorts shorter segments; this length and longer go to capacity bins.

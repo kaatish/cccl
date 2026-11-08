@@ -100,16 +100,39 @@ _CCCL_HOST_API cudaError_t dispatch_tiny_sort_and_partition(
   {
     return error;
   }
-  constexpr unsigned walk_threads  = tiny_walk_policy::block_threads;
-  constexpr unsigned walk_segments = walk_threads * tiny_walk_policy::segments_per_thread;
+  int sm_count = 0;
+  if (const auto error = CubDebug(launcher_factory.MultiProcessorCount(sm_count)))
+  {
+    return error;
+  }
   if (num_segments)
   {
+    constexpr auto walk_kernel      = tiny_walk_kernel<Capacities, BeginIterator, EndIterator, Key>;
+    constexpr unsigned walk_threads = tiny_walk_policy::block_threads;
+    int walk_blocks_per_sm          = 0;
+    if (const auto error = CubDebug(launcher_factory.MaxSmOccupancy(walk_blocks_per_sm, walk_kernel, walk_threads)))
+    {
+      return error;
+    }
+    // Shrink the tile while the grid would be short of min_waves waves of resident blocks.
+    const auto min_blocks = static_cast<unsigned long long>(tiny_walk_policy::min_waves) * sm_count
+                          * (::cuda::std::max) (walk_blocks_per_sm, 1);
+    const auto walk_grid  = [&](int segments_per_thread) {
+      const unsigned tile_segments = walk_threads * segments_per_thread;
+      return num_segments / tile_segments + (num_segments % tile_segments != 0);
+    };
+    int segments_per_thread = tiny_walk_policy::segments_per_thread;
+    while (segments_per_thread > 1 && walk_grid(segments_per_thread) < min_blocks)
+    {
+      segments_per_thread /= 2;
+    }
     if (const auto error = CubDebug(
-          launcher_factory(num_segments / walk_segments + (num_segments % walk_segments != 0), walk_threads, 0, stream)
-            .doit(tiny_walk_kernel<Capacities, BeginIterator, EndIterator, Key>,
+          launcher_factory(walk_grid(segments_per_thread), walk_threads, 0, stream)
+            .doit(walk_kernel,
                   begins,
                   ends,
                   num_segments,
+                  segments_per_thread,
                   in,
                   out,
                   counts,
@@ -126,11 +149,6 @@ _CCCL_HOST_API cudaError_t dispatch_tiny_sort_and_partition(
   }
   if (max_deferred)
   {
-    int sm_count = 0;
-    if (const auto error = CubDebug(launcher_factory.MultiProcessorCount(sm_count)))
-    {
-      return error;
-    }
     // The deferred count is not known on the host; the grid strides over it and never exceeds one block per
     // block_threads possible deferred segments.
     constexpr unsigned block_threads = partition_policy::block_threads;

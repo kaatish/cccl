@@ -107,12 +107,16 @@ struct tiny_walk_result
 };
 
 template <typename Capacities, typename Key>
-tiny_walk_result
-run_tiny_walk(const c2h::host_vector<unsigned>& begins, const c2h::host_vector<unsigned>& ends, const Key* in, Key* out)
+tiny_walk_result run_tiny_walk(
+  const c2h::host_vector<unsigned>& begins,
+  const c2h::host_vector<unsigned>& ends,
+  int segments_per_thread,
+  const Key* in,
+  Key* out)
 {
   using policy_t                        = capacity::tiny_walk_policy;
   const auto num_segments               = static_cast<unsigned>(begins.size());
-  constexpr unsigned tile_segments      = policy_t::block_threads * policy_t::segments_per_thread;
+  const unsigned tile_segments          = policy_t::block_threads * segments_per_thread;
   c2h::device_vector<unsigned> d_begins = begins, d_ends = ends;
   c2h::device_vector<unsigned> d_counts(Capacities::size + 1, 0), d_deferred_count(1, 0);
   c2h::device_vector<unsigned> d_deferred_ids(num_segments, ~0u);
@@ -121,6 +125,7 @@ run_tiny_walk(const c2h::host_vector<unsigned>& begins, const c2h::host_vector<u
       thrust::raw_pointer_cast(d_begins.data()),
       thrust::raw_pointer_cast(d_ends.data()),
       num_segments,
+      segments_per_thread,
       in,
       out,
       thrust::raw_pointer_cast(d_counts.data()),
@@ -238,14 +243,7 @@ CUB_TEST("Tiny walk sorts short segments and bins deferred ones by capacity",
     std::copy(input.begin() + begins[segment], input.begin() + ends[segment], expected.begin() + begins[segment]);
     std::sort(expected.begin() + begins[segment], expected.begin() + ends[segment]);
   }
-  c2h::device_vector<key_type> d_in = input, d_out(input.size(), key_type{-99});
-  const auto num_segments           = static_cast<unsigned>(lengths.size());
-  const auto walk                   = run_tiny_walk<capacities>(
-    begins, ends, thrust::raw_pointer_cast(d_in.data()), thrust::raw_pointer_cast(d_out.data()));
-  REQUIRE(c2h::host_vector<key_type>(d_out) == expected);
-  REQUIRE(walk.counts == expected_counts);
-  std::vector<unsigned> deferred(walk.deferred_ids.begin(), walk.deferred_ids.begin() + walk.deferred_count);
-  std::sort(deferred.begin(), deferred.end());
+  const auto num_segments = static_cast<unsigned>(lengths.size());
   std::vector<unsigned> expected_deferred;
   for (unsigned segment = 0; segment < num_segments; ++segment)
   {
@@ -254,11 +252,23 @@ CUB_TEST("Tiny walk sorts short segments and bins deferred ones by capacity",
       expected_deferred.push_back(segment);
     }
   }
-  REQUIRE(deferred == expected_deferred);
-  REQUIRE(std::all_of(walk.deferred_ids.begin() + walk.deferred_count, walk.deferred_ids.end(), [](unsigned id) {
-    return id == ~0u;
-  }));
-  check_compact_scatter<capacities>(begins, ends, walk, 1);
+  c2h::device_vector<key_type> d_in = input;
+  for (int segments_per_thread = policy_t::segments_per_thread; segments_per_thread > 0; segments_per_thread /= 2)
+  {
+    CAPTURE(segments_per_thread);
+    c2h::device_vector<key_type> d_out(input.size(), key_type{-99});
+    const auto walk = run_tiny_walk<capacities>(
+      begins, ends, segments_per_thread, thrust::raw_pointer_cast(d_in.data()), thrust::raw_pointer_cast(d_out.data()));
+    REQUIRE(c2h::host_vector<key_type>(d_out) == expected);
+    REQUIRE(walk.counts == expected_counts);
+    std::vector<unsigned> deferred(walk.deferred_ids.begin(), walk.deferred_ids.begin() + walk.deferred_count);
+    std::sort(deferred.begin(), deferred.end());
+    REQUIRE(deferred == expected_deferred);
+    REQUIRE(std::all_of(walk.deferred_ids.begin() + walk.deferred_count, walk.deferred_ids.end(), [](unsigned id) {
+      return id == ~0u;
+    }));
+    check_compact_scatter<capacities>(begins, ends, walk, 1);
+  }
 }
 
 // Deferred segments from many walk blocks arrive in atomic order; small scatter grids stride over the queue
@@ -281,11 +291,86 @@ CUB_TEST("Compact scatter bins a scattered deferred queue", "[segmented][sort][d
   }
   c2h::device_vector<int> d_in(num_keys, 0), d_out(num_keys, 0);
   const auto walk = run_tiny_walk<capacities>(
-    begins, ends, thrust::raw_pointer_cast(d_in.data()), thrust::raw_pointer_cast(d_out.data()));
+    begins, ends, 1, thrust::raw_pointer_cast(d_in.data()), thrust::raw_pointer_cast(d_out.data()));
   REQUIRE(walk.deferred_count == 15000);
   for (const unsigned grid_size : {1u, 3u, 64u})
   {
     check_compact_scatter<capacities>(begins, ends, walk, grid_size);
+  }
+}
+
+// Dispatch shrinks the walk tile for small inputs. These counts select 1, 2, and 4 segments per thread on H100
+// and B200; results must not depend on the choice.
+CUB_TEST("Tiny walk dispatch sorts and bins at every tile size", "[segmented][sort][device]", CUB_SMALL)
+{
+  using capacities     = irregular_expansion::capacities;
+  constexpr int cutoff = capacity::tiny_walk_policy::inline_cutoff;
+  for (const unsigned num_segments : {2000u, 700000u, 3000000u})
+  {
+    CAPTURE(num_segments);
+    std::mt19937 random{num_segments};
+    std::uniform_int_distribution<int> tiny_length{0, 3}, random_key{-1000, 1000};
+    c2h::host_vector<int> begins(num_segments), ends(num_segments), input;
+    std::vector<unsigned> expected_ids;
+    for (unsigned segment = 0; segment < num_segments; ++segment)
+    {
+      const bool deferred = segment % 97 == 0;
+      const int length    = deferred ? cutoff + static_cast<int>(segment % 3) : tiny_length(random);
+      begins[segment]     = static_cast<int>(input.size());
+      for (int i = 0; i < length; ++i)
+      {
+        input.push_back(random_key(random));
+      }
+      ends[segment] = static_cast<int>(input.size());
+      if (deferred)
+      {
+        expected_ids.push_back(segment);
+      }
+    }
+    c2h::host_vector<int> expected(input.size(), -99);
+    for (unsigned segment = 0; segment < num_segments; ++segment)
+    {
+      if (ends[segment] - begins[segment] < cutoff)
+      {
+        std::copy(input.begin() + begins[segment], input.begin() + ends[segment], expected.begin() + begins[segment]);
+        std::sort(expected.begin() + begins[segment], expected.begin() + ends[segment]);
+      }
+    }
+    c2h::device_vector<int> d_begins = begins, d_ends = ends, d_in = input, d_out(input.size(), -99);
+    capacity::partition_result result;
+    size_t bytes      = 0;
+    const auto launch = [&](void* storage) {
+      return capacity::dispatch_tiny_sort_and_partition<capacities>(
+        storage,
+        bytes,
+        thrust::raw_pointer_cast(d_begins.data()),
+        thrust::raw_pointer_cast(d_ends.data()),
+        static_cast<cuda::std::int64_t>(input.size()),
+        num_segments,
+        thrust::raw_pointer_cast(d_in.data()),
+        thrust::raw_pointer_cast(d_out.data()),
+        result);
+    };
+    REQUIRE(launch(nullptr) == cudaSuccess);
+    c2h::device_vector<unsigned char> storage(bytes);
+    REQUIRE(launch(thrust::raw_pointer_cast(storage.data())) == cudaSuccess);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    REQUIRE(c2h::host_vector<int>(d_out) == expected);
+    c2h::host_vector<unsigned> offsets(capacities::size + 2);
+    REQUIRE(cudaMemcpy(offsets.data(), result.bin_offsets, offsets.size() * sizeof(unsigned), cudaMemcpyDeviceToHost)
+            == cudaSuccess);
+    REQUIRE(offsets.back() == expected_ids.size());
+    std::vector<unsigned> ids(offsets.back());
+    REQUIRE(
+      cudaMemcpy(ids.data(), result.segment_ids, ids.size() * sizeof(unsigned), cudaMemcpyDeviceToHost) == cudaSuccess);
+    for (unsigned i = 0; i < ids.size(); ++i)
+    {
+      const int length = ends[ids[i]] - begins[ids[i]];
+      REQUIRE(i >= offsets[length == cutoff ? 0 : 1]);
+      REQUIRE(i < offsets[length == cutoff ? 1 : 2]);
+    }
+    std::sort(ids.begin(), ids.end());
+    REQUIRE(ids == expected_ids);
   }
 }
 
