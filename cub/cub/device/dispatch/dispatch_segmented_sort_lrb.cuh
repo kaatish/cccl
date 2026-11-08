@@ -76,8 +76,8 @@ _CCCL_HOST_API cudaError_t dispatch_tiny_sort_and_partition(
   const auto max_deferred = static_cast<unsigned>(
     (::cuda::std::min) (::cuda::std::int64_t{num_segments},
                         (::cuda::std::max) (num_items, ::cuda::std::int64_t{0}) / tiny_walk_policy::inline_cutoff));
-  // The first allocation holds counts and the deferred count (cleared together), offsets (with an end
-  // sentinel), and cursors. The others hold binned IDs and the walk's deferred IDs.
+  // The first allocation holds counts, the deferred count, offsets (with an end sentinel), and cursors, all
+  // cleared together. The others hold binned IDs and the walk's deferred IDs.
   const size_t sizes[] = {sizeof(unsigned) * (3 * total_bins + 2),
                           sizeof(unsigned) * size_t{max_deferred},
                           sizeof(unsigned) * size_t{max_deferred}};
@@ -96,7 +96,7 @@ _CCCL_HOST_API cudaError_t dispatch_tiny_sort_and_partition(
   auto* cursors        = offsets + total_bins + 1;
   auto* deferred_ids   = static_cast<unsigned*>(allocations[2]);
   result               = {offsets, static_cast<unsigned*>(allocations[1])};
-  if (const auto error = CubDebug(cudaMemsetAsync(counts, 0, (total_bins + 1) * sizeof(unsigned), stream)))
+  if (const auto error = CubDebug(cudaMemsetAsync(counts, 0, sizes[0], stream)))
   {
     return error;
   }
@@ -142,15 +142,10 @@ _CCCL_HOST_API cudaError_t dispatch_tiny_sort_and_partition(
       return error;
     }
   }
-  if (const auto error =
-        CubDebug(launcher_factory(1, 1, 0, stream).doit(segment_prefix_kernel<Capacities>, counts, offsets, cursors)))
-  {
-    return error;
-  }
   if (max_deferred)
   {
     // The deferred count is not known on the host; the grid strides over it and never exceeds one block per
-    // block_threads possible deferred segments.
+    // block_threads possible deferred segments. The scatter also writes the bin offsets.
     constexpr unsigned block_threads = partition_policy::block_threads;
     const unsigned grid_size = (::cuda::std::min) (static_cast<unsigned>(sm_count) * partition_policy::blocks_per_sm,
                                                    max_deferred / block_threads + (max_deferred % block_threads != 0));
@@ -159,9 +154,11 @@ _CCCL_HOST_API cudaError_t dispatch_tiny_sort_and_partition(
             .doit(compact_scatter_kernel<Capacities, BeginIterator, EndIterator>,
                   begins,
                   ends,
+                  counts,
                   deferred_count,
                   deferred_ids,
                   cursors,
+                  offsets,
                   result.segment_ids)))
     {
       return error;
@@ -174,7 +171,9 @@ _CCCL_HOST_API cudaError_t dispatch_tiny_sort_and_partition(
   return CubDebug(DebugSyncStream(stream));
 }
 
-// Configure shared scratch, validate occupancy, and launch one sorting kernel with a policy-sized grid.
+// Configure shared scratch, validate occupancy, and launch one sorting kernel. The kernel strides over its work,
+// so the grid is one wave of resident blocks, capped by the policy multiplier; more waves only repeat each block's
+// bin prefix.
 template <typename Kernel, int CC, typename Key, typename BeginIterator, typename EndIterator, typename KernelLauncherFactory>
 _CCCL_HOST_API cudaError_t launch_sort_kernel(
   partition_result bins,
@@ -207,7 +206,8 @@ _CCCL_HOST_API cudaError_t launch_sort_kernel(
   {
     return cudaErrorInvalidConfiguration;
   }
-  const unsigned long long grid_size = static_cast<unsigned long long>(sm_count) * tuning.grid_size_multiplier;
+  const unsigned long long grid_size =
+    static_cast<unsigned long long>(sm_count) * (::cuda::std::min) (occupancy, tuning.grid_size_multiplier);
   if (const auto error = CubDebug(
         launcher_factory(static_cast<unsigned>(grid_size), tuning.block_threads, dynamic_smem_bytes, stream)
           .doit(kernel, bins, begins, ends, in, out)))

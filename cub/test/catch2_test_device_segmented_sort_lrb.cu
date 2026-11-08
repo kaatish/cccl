@@ -136,8 +136,9 @@ tiny_walk_result run_tiny_walk(
   return {d_counts, c2h::host_vector<unsigned>(d_deferred_count)[0], d_deferred_ids};
 }
 
-// The walk's counts size the bins; scattering its queue must fill each bin with exactly the deferred segments
-// first_fit assigns to it, advance each cursor to the bin's end, and leave ID slots past the last bin unwritten.
+// The walk's counts size the bins; scattering its queue must write their prefix as offsets, fill each bin with
+// exactly the deferred segments first_fit assigns to it, advance each cursor to the bin's count, and leave ID slots
+// past the last bin unwritten.
 template <typename Capacities>
 void check_compact_scatter(const c2h::host_vector<unsigned>& begins,
                            const c2h::host_vector<unsigned>& ends,
@@ -149,24 +150,24 @@ void check_compact_scatter(const c2h::host_vector<unsigned>& begins,
   c2h::device_vector<unsigned> d_deferred_count(1, walk.deferred_count), d_deferred_ids = walk.deferred_ids;
   c2h::device_vector<unsigned> d_offsets(Capacities::size + 2), d_cursors(Capacities::size + 1);
   c2h::device_vector<unsigned> d_ids(num_segments, ~0u);
-  capacity::segment_prefix_kernel<Capacities>
-    <<<1, 1>>>(thrust::raw_pointer_cast(d_counts.data()),
-               thrust::raw_pointer_cast(d_offsets.data()),
-               thrust::raw_pointer_cast(d_cursors.data()));
   capacity::compact_scatter_kernel<Capacities><<<grid_size, capacity::partition_policy::block_threads>>>(
     thrust::raw_pointer_cast(d_begins.data()),
     thrust::raw_pointer_cast(d_ends.data()),
+    thrust::raw_pointer_cast(d_counts.data()),
     thrust::raw_pointer_cast(d_deferred_count.data()),
     thrust::raw_pointer_cast(d_deferred_ids.data()),
     thrust::raw_pointer_cast(d_cursors.data()),
+    thrust::raw_pointer_cast(d_offsets.data()),
     thrust::raw_pointer_cast(d_ids.data()));
   REQUIRE(cudaGetLastError() == cudaSuccess);
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
   const c2h::host_vector<unsigned> offsets = d_offsets;
   const c2h::host_vector<unsigned> cursors = d_cursors;
   const c2h::host_vector<unsigned> ids     = d_ids;
+  REQUIRE(offsets[0] == 0);
   for (int bin_idx = 0; bin_idx <= Capacities::size; ++bin_idx)
   {
+    REQUIRE(offsets[bin_idx + 1] == offsets[bin_idx] + walk.counts[bin_idx]);
     std::vector<unsigned> bin_ids(ids.begin() + offsets[bin_idx], ids.begin() + offsets[bin_idx + 1]);
     std::vector<unsigned> expected_ids;
     for (unsigned segment = 0; segment < num_segments; ++segment)
@@ -180,7 +181,7 @@ void check_compact_scatter(const c2h::host_vector<unsigned>& begins,
     }
     std::sort(bin_ids.begin(), bin_ids.end());
     REQUIRE(bin_ids == expected_ids);
-    REQUIRE(cursors[bin_idx] == offsets[bin_idx + 1]);
+    REQUIRE(cursors[bin_idx] == walk.counts[bin_idx]);
   }
   REQUIRE(std::all_of(ids.begin() + offsets.back(), ids.end(), [](unsigned id) {
     return id == ~0u;

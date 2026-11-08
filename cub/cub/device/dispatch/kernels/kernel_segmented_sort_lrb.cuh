@@ -17,6 +17,7 @@
 #endif // no system header
 
 #include <cub/agent/agent_segmented_sort_tiny.cuh>
+#include <cub/block/block_scan.cuh>
 #include <cub/detail/segmented_sort_entries.cuh>
 #include <cub/device/dispatch/tuning/tuning_segmented_sort_group_merge.cuh>
 #include <cub/util_arch.cuh>
@@ -125,35 +126,53 @@ __launch_bounds__(tiny_walk_policy::block_threads) _CCCL_KERNEL_ATTRIBUTES void 
   sort_queue(::cuda::std::integral_constant<int, 4>{}, 2);
 }
 
-// One thread converts bin counts into global ID offsets and initial scatter cursors.
-template <typename Capacities>
-_CCCL_KERNEL_ATTRIBUTES void segment_prefix_kernel(const unsigned* counts, unsigned* offsets, unsigned* cursors)
-{
-  unsigned prefix = 0;
-  for (int bin_idx = 0; bin_idx <= Capacities::size; ++bin_idx)
-  {
-    offsets[bin_idx] = cursors[bin_idx] = prefix;
-    prefix += counts[bin_idx];
-  }
-  offsets[Capacities::size + 1] = prefix;
-}
-
-// Scatter the walk's deferred IDs into reserved per-bin ranges, reading offsets for deferred segments only.
-// Every deferred segment holds at least inline_cutoff keys, so each has a bin.
+// Scatter the walk's deferred IDs into per-bin ranges, reading offsets for deferred segments only.
+// Every deferred segment holds at least inline_cutoff keys, so each has a bin. Each block with work scans the
+// walk's counts into bin offsets, and block 0 writes them, with an end sentinel, to offsets. cursors start at zero
+// and count IDs placed per bin. Offsets left zero are correct when nothing is deferred.
 template <typename Capacities, typename BeginIterator, typename EndIterator>
 __launch_bounds__(partition_policy::block_threads) _CCCL_KERNEL_ATTRIBUTES void compact_scatter_kernel(
   BeginIterator begins,
   EndIterator ends,
+  const unsigned* counts,
   const unsigned* deferred_count,
   const unsigned* deferred_ids,
   unsigned* cursors,
+  unsigned* offsets,
   unsigned* ids)
 {
-  constexpr unsigned total_bins = Capacities::size + 1;
+  constexpr unsigned total_bins    = Capacities::size + 1;
+  constexpr int block_threads      = partition_policy::block_threads;
+  using block_scan_t               = BlockScan<unsigned, block_threads>;
+  static_assert(total_bins <= block_threads, "Each thread scans at most one bin count");
+  __shared__ typename block_scan_t::TempStorage scan_storage;
+  __shared__ unsigned bin_offsets_shared[total_bins];
   __shared__ unsigned bin_counts_shared[total_bins];
   __shared__ unsigned bin_starts_shared[total_bins];
   const unsigned num_deferred = *deferred_count;
-  const auto tile_stride      = static_cast<unsigned long long>(gridDim.x) * blockDim.x;
+  if (static_cast<unsigned long long>(blockIdx.x) * blockDim.x >= num_deferred)
+  {
+    return;
+  }
+  {
+    const unsigned count = threadIdx.x < total_bins ? counts[threadIdx.x] : 0u;
+    unsigned bin_offset  = 0;
+    unsigned total       = 0;
+    block_scan_t(scan_storage).ExclusiveSum(count, bin_offset, total);
+    if (threadIdx.x < total_bins)
+    {
+      bin_offsets_shared[threadIdx.x] = bin_offset;
+      if (blockIdx.x == 0)
+      {
+        offsets[threadIdx.x] = bin_offset;
+      }
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+      offsets[total_bins] = total;
+    }
+  }
+  const auto tile_stride = static_cast<unsigned long long>(gridDim.x) * blockDim.x;
   for (auto tile_begin = static_cast<unsigned long long>(blockIdx.x) * blockDim.x; tile_begin < num_deferred;
        tile_begin += tile_stride)
   {
@@ -177,7 +196,7 @@ __launch_bounds__(partition_policy::block_threads) _CCCL_KERNEL_ATTRIBUTES void 
     {
       if (bin_counts_shared[i])
       {
-        bin_starts_shared[i] = atomicAdd(cursors + i, bin_counts_shared[i]);
+        bin_starts_shared[i] = bin_offsets_shared[i] + atomicAdd(cursors + i, bin_counts_shared[i]);
       }
     }
     __syncthreads();

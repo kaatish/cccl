@@ -52,7 +52,7 @@ struct group_merge_policy
   int max_threads;
   int min_ipt;
   int max_ipt;
-  int grid_size_multiplier; // Grid-size multiplier: launch SM count * grid_size_multiplier blocks.
+  int grid_size_multiplier; // At most SM count * grid_size_multiplier blocks; dispatch launches one resident wave.
   int min_blocks_per_sm; // __launch_bounds__ target for compiler register allocation, not the grid size.
 };
 
