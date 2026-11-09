@@ -49,7 +49,8 @@ __global__ void tiny_sort_kernel(const int* begins, const int* ends, unsigned nu
   }
 }
 
-// Check every length up to each logical warp's capacity, with partial final passes and untouched gaps.
+// Check every length each logical warp accepts (above half its capacity, when wider than one thread, up to its
+// capacity), with partial final passes and untouched gaps.
 CUB_TEST("Tiny sort sorts each segment within its logical warp capacity",
          "[segmented][sort][device]",
          CUB_SMALL,
@@ -59,13 +60,14 @@ CUB_TEST("Tiny sort sorts each segment within its logical warp capacity",
   const auto check = [](auto logical_warp_threads) {
     constexpr int threads    = decltype(logical_warp_threads)::value;
     constexpr int max_length = threads * capacity::tiny_walk_policy::items_per_thread;
+    constexpr int min_length = threads == 1 ? 0 : max_length / 2 + 1;
     c2h::host_vector<int> begins, ends;
     c2h::host_vector<key_type> input;
     std::mt19937 random{threads};
     std::uniform_int_distribution<int> random_key{-1000, 1000};
     for (int repeat = 0; repeat < 3; ++repeat)
     {
-      for (int length = 0; length <= max_length; ++length)
+      for (int length = min_length; length <= max_length; ++length)
       {
         input.push_back(key_type{-99});
         begins.push_back(static_cast<int>(input.size()));
